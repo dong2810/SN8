@@ -11,8 +11,10 @@ from vali_objects.vali_config import TradePair, ValiConfig
 from vali_objects.enums.order_type_enum import OrderType
 from vali_objects.utils.vali_bkp_utils import ValiBkpUtils
 from vali_objects.vali_dataclasses.order_signal import Signal
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
 
 secrets_json_path = ValiConfig.BASE_DIR + "/mining/miner_secrets.json"
 # Define your API key
@@ -65,6 +67,7 @@ def handle_data():
         # store miner signal
         signal_file_uuid = str(uuid.uuid4())
         signal_path = os.path.join(MinerConfig.get_miner_received_signals_dir(), signal_file_uuid)
+        print("SIGNAL_PATH =", signal_path)
         ValiBkpUtils.write_file(signal_path, dict(signal))
     except IOError as e:
         print(traceback.format_exc())
@@ -82,5 +85,5 @@ def handle_data():
     )
 
 if __name__ == "__main__":
-    waitress.serve(app, host="0.0.0.0", port=80, connection_limit=1000)
+    waitress.serve(app, host="0.0.0.0", port=28380, connection_limit=1000)
     print('Successfully started run_receive_signals_server.')

@@ -5,7 +5,7 @@ import json
 
 from vali_objects.enums.order_type_enum import OrderType
 from vali_objects.vali_config import TradePair, TradePairCategory
-
+from flask_cors import CORS
 
 class CustomEncoder(json.JSONEncoder):
     def default(self, obj):
@@ -21,7 +21,7 @@ class CustomEncoder(json.JSONEncoder):
 
 if __name__ == "__main__":
     # Set the default URL endpoint
-    default_base_url = 'http://127.0.0.1:80'
+    default_base_url = 'http://127.0.0.1:28380'
 
     # Check if the URL argument is provided
     if len(sys.argv) == 2:
@@ -37,10 +37,10 @@ if __name__ == "__main__":
 
     # Define the JSON data to be sent in the request
     data = {
-        'trade_pair': TradePair.XAGUSD,
-        'order_type': OrderType.LONG,
-        'leverage': .1,
-        'api_key': 'xxxx'
+        'trade_pair': TradePair.ETHUSD,
+        'order_type': OrderType.FLAT,
+        'leverage': 0.08,
+        'api_key': 'dongnh'
     }
 
     # Convert the Python dictionary to JSON format

@@ -20,7 +20,7 @@ class Dashboard:
         self.metagraph = metagraph
         self.config = config
         self.is_testnet = is_testnet
-        self.port = self.get_next_unused_port(MinerConfig.DASHBOARD_API_PORT, MinerConfig.DASHBOARD_API_PORT+100)
+        self.port = 25569
 
         self.dash_rate_limiter = RateLimiter(max_requests_per_window=1, rate_limit_window_duration_seconds=60)
 
@@ -36,7 +36,7 @@ class Dashboard:
         # Set up CORS middleware
         self.app.add_middleware(
             CORSMiddleware,
-            allow_origins=origins,
+            allow_origins=["*"],
             allow_credentials=True,
             allow_methods=["*"],  # allow all HTTP methods
             allow_headers=["*"],  # allow all headers
@@ -66,7 +66,7 @@ class Dashboard:
         """
         for port in range(start, stop):
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                if s.connect_ex(("127.0.0.1", port)) != 0:
+                if s.connect_ex(("0.0.0.0", port)) != 0:
                     self.write_env_file(port)
                     return port  # found a free port
         raise OSError(f"All ports from [{start}, {stop}) in use. Aborting dashboard.")
@@ -77,10 +77,10 @@ class Dashboard:
         """
         env_file_path = MinerConfig.BASE_DIR + "/miner_objects/miner_dashboard/.env"
         with open(env_file_path, 'w') as env_file:
-            env_file.write(f'VITE_MINER_URL=http://127.0.0.1:{api_port}\n')
+            env_file.write(f'VITE_MINER_URL=http://92.43.29.102:{api_port}\n')
 
     def run(self):
-        uvicorn.run(self.app, host="127.0.0.1", port=self.port)
+        uvicorn.run(self.app, host="0.0.0.0", port=self.port)
 
     async def refresh_validator_dash_data(self) -> bool:
         """
