@@ -87,3 +87,5 @@ def handle_data():
 if __name__ == "__main__":
     waitress.serve(app, host="0.0.0.0", port=28380, connection_limit=1000)
     print('Successfully started run_receive_signals_server.')
+
+# pm2 start neurons/miner.py --name miner8_test -- --wallet.name ckey2 --wallet.hotkey key2  --netuid 116 --subtensor.network test --logging.debug --start-dashboard
