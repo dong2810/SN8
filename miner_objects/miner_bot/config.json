@@ -1,0 +1,16 @@
+{
+  "settings": {
+    "coin_list": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"],
+    "test_mode": false,
+    "scan_interval_seconds": 60,
+    "trailing_start_threshold_percent": 1.0,
+    "trailing_distance_percent": 1.5,
+    "fast_stop_loss_threshold_percent": 2.0,
+    "global_drawdown_limit_percent": 0.015,
+    "max_open_positions": 5
+  },
+  "auto_trade_time": {
+    "start": "16:00",
+    "end": "23:00"
+  }
+}
