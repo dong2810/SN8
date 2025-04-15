@@ -89,3 +89,5 @@ if __name__ == "__main__":
     print('Successfully started run_receive_signals_server.')
 
 # pm2 start neurons/miner.py --name miner8_test -- --wallet.name ckey2 --wallet.hotkey key2  --netuid 116 --subtensor.network test --logging.debug --start-dashboard
+
+# pm2 start neurons/miner.py --name miner8_key2 -- --wallet.name ckey2 --wallet.hotkey key1  --netuid 8 --subtensor.network finney --logging.debug --start-dashboard
