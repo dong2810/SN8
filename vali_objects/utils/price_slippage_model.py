@@ -23,10 +23,11 @@ class PriceSlippageModel:
     is_backtesting = False
     fetch_slippage_data = False
     recalculate_slippage = False
-    leverage_to_capital = ValiConfig.LEVERAGE_TO_CAPITAL
+    capital = ValiConfig.CAPITAL
+    last_refresh_time_ms = 0
 
     def __init__(self, live_price_fetcher=None, running_unit_tests=False, is_backtesting=False,
-                 fetch_slippage_data=False, recalculate_slippage=False, leverage_to_capital=ValiConfig.LEVERAGE_TO_CAPITAL):
+                 fetch_slippage_data=False, recalculate_slippage=False, capital=ValiConfig.CAPITAL):
         if not PriceSlippageModel.parameters:
             PriceSlippageModel.holidays_nyse = holidays.financial_holidays('NYSE')
             PriceSlippageModel.parameters = self.read_slippage_model_parameters()
@@ -39,10 +40,10 @@ class PriceSlippageModel:
         PriceSlippageModel.is_backtesting = is_backtesting
         PriceSlippageModel.fetch_slippage_data = fetch_slippage_data
         PriceSlippageModel.recalculate_slippage = recalculate_slippage
-        PriceSlippageModel.leverage_to_capital = leverage_to_capital
+        PriceSlippageModel.capital = capital
 
     @classmethod
-    def calculate_slippage(cls, bid:float, ask:float, order:Order, leverage_to_capital=ValiConfig.LEVERAGE_TO_CAPITAL):
+    def calculate_slippage(cls, bid:float, ask:float, order:Order, capital=ValiConfig.CAPITAL):
         """
         returns the percentage slippage of the current order.
         each asset class uses a unique model
@@ -52,7 +53,7 @@ class PriceSlippageModel:
             if not trade_pair.is_crypto:  # For now, crypto does not have slippage
                 bt.logging.warning(f'Tried to calculate slippage with bid: {bid} and ask: {ask}. order: {order}. Returning 0')
             return 0  # Need valid bid and ask.
-        size = abs(order.leverage) * leverage_to_capital
+        size = abs(order.leverage) * capital
         if size <= 1000:
             return 0  # assume 0 slippage when order size is under 1k
         if cls.is_backtesting:
@@ -83,7 +84,7 @@ class PriceSlippageModel:
         spread = ask - bid
         mid_price = (bid + ask) / 2
 
-        size = abs(order.leverage) * ValiConfig.LEVERAGE_TO_CAPITAL
+        size = abs(order.leverage) * ValiConfig.CAPITAL
         volume_shares = size / mid_price
 
         if order.processed_ms > 1735718400000:  # Use fitted BB+ for orders after jan 1, 2024, 08:00:00 UTC
@@ -114,7 +115,7 @@ class PriceSlippageModel:
 
         # bt.logging.info(f"bid: {bid}, ask: {ask}, adv: {avg_daily_volume}, vol: {annualized_volatility}")
 
-        size = abs(order.leverage) * ValiConfig.LEVERAGE_TO_CAPITAL
+        size = abs(order.leverage) * ValiConfig.CAPITAL
         base, _ = order.trade_pair.trade_pair.split("/")
         base_to_usd_conversion = cls.live_price_fetcher.polygon_data_service.get_currency_conversion(base=base, quote="USD") if base != "USD" else 1  # TODO: fallback?
         # print(base_to_usd_conversion)
@@ -140,6 +141,7 @@ class PriceSlippageModel:
         else:
             raise ValueError(f"Unknown crypto slippage for trade pair {trade_pair.trade_pair_id}")
 
+
     @classmethod
     def refresh_features_daily(cls, time_ms:int=None, write_to_disk:bool=True):
         """
@@ -149,23 +151,29 @@ class PriceSlippageModel:
             time_ms = TimeUtil.now_in_millis()
         current_date = TimeUtil.millis_to_short_date_str(time_ms)
 
-        if current_date not in cls.features:
-            bt.logging.info(
-                f"Calculating avg daily volume and annualized volatility for new day UTC {current_date}")
-            trade_pairs = [tp for tp in TradePair if tp.is_forex or tp.is_equities]
-            tp_to_adv, tp_to_vol = cls.get_features(trade_pairs=trade_pairs, processed_ms=time_ms)
-            if tp_to_adv and tp_to_vol:
-                cls.features[current_date] = {
-                    "adv": tp_to_adv,
-                    "vol": tp_to_vol
-                }
+        if current_date in cls.features:
+            return
 
-                if write_to_disk:
-                    cls.write_features_from_memory_to_disk()
-                bt.logging.info(
-                        f"Completed refreshing avg daily volume and annualized volatility for new day UTC {current_date}")
-            else:
-                bt.logging.info(f"Skipping feature update for {current_date} due to missing data. tp_to_adv: {bool(tp_to_adv)}, tp_to_vol: {bool(tp_to_vol)}")
+        if not cls.is_backtesting and time_ms - cls.last_refresh_time_ms < 1000:
+            return
+
+        bt.logging.info(
+            f"Calculating avg daily volume and annualized volatility for new day UTC {current_date}")
+        trade_pairs = [tp for tp in TradePair if tp.is_forex or tp.is_equities]
+        tp_to_adv, tp_to_vol = cls.get_features(trade_pairs=trade_pairs, processed_ms=time_ms)
+        if tp_to_adv and tp_to_vol:
+            cls.features[current_date] = {
+                "adv": tp_to_adv,
+                "vol": tp_to_vol
+            }
+
+            if write_to_disk:
+                cls.write_features_from_memory_to_disk()
+            bt.logging.info(
+                    f"Completed refreshing avg daily volume and annualized volatility for new day UTC {current_date}")
+        else:
+            bt.logging.info(f"Skipping feature update for {current_date} due to missing data. tp_to_adv: {bool(tp_to_adv)}, tp_to_vol: {bool(tp_to_vol)}")
+        cls.last_refresh_time_ms = time_ms
 
     @classmethod
     def get_features(cls, trade_pairs: list[TradePair], processed_ms: int, adv_lookback_window: int = 10,
@@ -264,9 +272,18 @@ class PriceSlippageModel:
                     bt.logging.info(f"updating order attributes {o}")
                     bid = o.bid
                     ask = o.ask
+
                     if self.fetch_slippage_data:
-                        bid, ask, _ = self.live_price_fetcher.get_sorted_price_sources_for_trade_pair(trade_pair=o.trade_pair, time_ms=o.processed_ms)
-                    slippage = self.calculate_slippage(bid, ask, o, leverage_to_capital=self.leverage_to_capital)
+
+                        price_sources = self.live_price_fetcher.get_sorted_price_sources_for_trade_pair(trade_pair=o.trade_pair, time_ms=o.processed_ms)
+                        if not price_sources:
+                            raise ValueError(
+                                f"Ignoring order for [{hk}] due to no live prices being found for trade_pair [{o.trade_pair}]. Please try again.")
+                        best_price_source = price_sources[0]
+                        bid = best_price_source.bid
+                        ask = best_price_source.ask
+
+                    slippage = self.calculate_slippage(bid, ask, o, capital=self.capital)
                     o.bid = bid
                     o.ask = ask
                     o.slippage = slippage

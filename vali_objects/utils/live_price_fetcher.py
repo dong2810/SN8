@@ -2,7 +2,6 @@ import time
 from typing import List, Tuple, Dict
 
 import numpy as np
-
 from data_generator.tiingo_data_service import TiingoDataService
 from data_generator.polygon_data_service import PolygonDataService
 from time_util.time_util import TimeUtil, timeme
@@ -11,12 +10,14 @@ from vali_objects.vali_config import TradePair
 from vali_objects.position import Position
 from vali_objects.utils.vali_utils import ValiUtils
 import bittensor as bt
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
 from vali_objects.vali_dataclasses.price_source import PriceSource
 from statistics import median
 
 class LivePriceFetcher:
-    def __init__(self, secrets, disable_ws=False, ipc_manager=None):
+    def __init__(self, secrets, disable_ws=False, ipc_manager=None, is_backtesting=False):
+        self.is_backtesting = is_backtesting
         if "tiingo_apikey" in secrets:
             self.tiingo_data_service = TiingoDataService(api_key=secrets["tiingo_apikey"], disable_ws=disable_ws,
                                                          ipc_manager=ipc_manager)
@@ -24,17 +25,12 @@ class LivePriceFetcher:
             raise Exception("Tiingo API key not found in secrets.json")
         if "polygon_apikey" in secrets:
             self.polygon_data_service = PolygonDataService(api_key=secrets["polygon_apikey"], disable_ws=disable_ws,
-                                                           ipc_manager=ipc_manager)
+                                                           ipc_manager=ipc_manager, is_backtesting=is_backtesting)
         else:
             raise Exception("Polygon API key not found in secrets.json")
 
     def stop_all_threads(self):
-        if self.tiingo_data_service.websocket_manager_thread:
-            self.tiingo_data_service.websocket_manager_thread.join()
         self.tiingo_data_service.stop_threads()
-
-        if self.polygon_data_service.websocket_manager_thread:
-            self.polygon_data_service.websocket_manager_thread.join()
         self.polygon_data_service.stop_threads()
 
     def sorted_valid_price_sources(self, price_events: List[PriceSource | None], current_time_ms: int, filter_recent_only=True) -> List[PriceSource] | None:
@@ -49,10 +45,36 @@ class LivePriceFetcher:
         if not best_event:
             return None
 
-        if filter_recent_only and best_event.time_delta_from_now_ms(current_time_ms) > 3000:
+        if filter_recent_only and best_event.time_delta_from_now_ms(current_time_ms) > 8000:
             return None
 
         return PriceSource.non_null_events_sorted(valid_events, current_time_ms)
+
+    def dual_rest_get(
+            self,
+            trade_pairs: List[TradePair]
+    ) -> Tuple[Dict[TradePair, PriceSource], Dict[TradePair, PriceSource]]:
+        """
+        Fetch REST closes from both Polygon and Tiingo in parallel,
+        using ThreadPoolExecutor to run both calls concurrently.
+        """
+        polygon_results = {}
+        tiingo_results = {}
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            # Submit both REST calls to the executor
+            poly_fut = executor.submit(self.polygon_data_service.get_closes_rest, trade_pairs)
+            tiingo_fut = executor.submit(self.tiingo_data_service.get_closes_rest, trade_pairs)
+
+            try:
+                # Wait for both futures to complete with a 10s timeout
+                polygon_results = poly_fut.result(timeout=10)
+                tiingo_results = tiingo_fut.result(timeout=10)
+            except FuturesTimeoutError:
+                poly_fut.cancel()
+                tiingo_fut.cancel()
+                bt.logging.warning(f"dual_rest_get REST API requests timed out. trade_pairs: {trade_pairs}.")
+
+        return polygon_results, tiingo_results
 
     def get_ws_price_sources_in_window(self, trade_pair: TradePair, start_ms: int, end_ms: int) -> List[PriceSource]:
         # Utilize get_events_in_range
@@ -107,8 +129,7 @@ class LivePriceFetcher:
         if not trade_pairs_needing_rest_data:
             return results
 
-        rest_prices_polygon = self.polygon_data_service.get_closes_rest(trade_pairs_needing_rest_data)
-        rest_prices_tiingo_data = self.tiingo_data_service.get_closes_rest(trade_pairs_needing_rest_data)
+        rest_prices_polygon, rest_prices_tiingo_data = self.dual_rest_get(trade_pairs_needing_rest_data)
 
         for trade_pair in trade_pairs_needing_rest_data:
             current_time_ms = trade_pair_to_last_order_time_ms[trade_pair]
@@ -248,20 +269,33 @@ class LivePriceFetcher:
         #    ans.update(closes)
         return ans
 
-    def get_close_at_date(self, trade_pair, timestamp_ms):
-        price, time_delta = self.polygon_data_service.get_close_at_date_second(trade_pair=trade_pair, target_timestamp_ms=timestamp_ms)
-        if price is None:
-            price, time_delta = self.tiingo_data_service.get_close_at_date(trade_pair=trade_pair, timestamp_ms=timestamp_ms)
-            if price is not None:
+    def get_close_at_date(self, trade_pair, timestamp_ms, order=None):
+        if self.is_backtesting:
+            assert order, 'Must provide order for validation during backtesting'
+
+        price_source = None
+        if not self.polygon_data_service.is_market_open(trade_pair):
+            if self.is_backtesting and order and order.src == 0:
+                raise Exception(f"Backtesting validation failure: Attempting to price fill during closed market. TP {trade_pair.trade_pair_id} at {TimeUtil.millis_to_formatted_date_str(timestamp_ms)}")
+            else:
+                price_source = self.polygon_data_service.get_event_before_market_close(trade_pair, end_time_ms=timestamp_ms)
+                print(f'Used previous close to fill price for {trade_pair.trade_pair_id} at {TimeUtil.millis_to_formatted_date_str(timestamp_ms)}')
+
+        if price_source is None:
+            price_source = self.polygon_data_service.get_close_at_date_second(trade_pair=trade_pair, target_timestamp_ms=timestamp_ms)
+        if price_source is None:
+            price_source = self.polygon_data_service.get_close_at_date_minute_fallback(trade_pair=trade_pair, target_timestamp_ms=timestamp_ms)
+            if price_source:
+                bt.logging.warning(
+                    f"Fell back to Polygon get_date_minute_fallback for price of {trade_pair.trade_pair} at {TimeUtil.timestamp_ms_to_eastern_time_str(timestamp_ms)}, price_source: {price_source}")
+
+        if price_source is None:
+            price_source = self.tiingo_data_service.get_close_rest(trade_pair=trade_pair, target_time_ms=timestamp_ms)
+            if price_source is not None:
                 bt.logging.warning(
                     f"Fell back to Tiingo get_date for price of {trade_pair.trade_pair} at {TimeUtil.timestamp_ms_to_eastern_time_str(timestamp_ms)}, ms: {timestamp_ms}")
 
-        if price is None:
-            price, time_delta = self.polygon_data_service.get_close_at_date_minute_fallback(trade_pair=trade_pair,
-                                                                               timestamp_ms=timestamp_ms)
-            if price:
-                bt.logging.warning(
-                    f"Fell back to Polygon get_date_minute_fallback for price of {trade_pair.trade_pair} at {TimeUtil.timestamp_ms_to_eastern_time_str(timestamp_ms)}, ms: {timestamp_ms}")
+
         """
         if price is None:
             price, time_delta = self.polygon_data_service.get_close_in_past_hour_fallback(trade_pair=trade_pair,
@@ -276,13 +310,16 @@ class LivePriceFetcher:
                 f"Failed to get data at ET date {formatted_date} for {trade_pair.trade_pair}. Timestamp ms: {timestamp_ms}."
                 f" Ask a team member to investigate this issue.")
         """
-        return price, time_delta
+        return price_source
 
 
 if __name__ == "__main__":
     secrets = ValiUtils.get_secrets()
-    live_price_fetcher = LivePriceFetcher(secrets)
+    live_price_fetcher = LivePriceFetcher(secrets, disable_ws=False)
+    ans = live_price_fetcher.get_close_at_date(TradePair.USDJPY, 1733304060475)
+    print(ans)
     time.sleep(100000)
+
     trade_pairs = [TradePair.BTCUSD, TradePair.ETHUSD, ]
     while True:
         for tp in TradePair:

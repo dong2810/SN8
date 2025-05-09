@@ -6,6 +6,7 @@ from pydantic import field_validator
 
 from vali_objects.enums.order_type_enum import OrderType
 from vali_objects.vali_dataclasses.order_signal import Signal
+from vali_objects.vali_dataclasses.price_source import PriceSource
 from enum import Enum, auto
 
 ORDER_SRC_ORGANIC = 0               # order generated from a miner's signal
@@ -40,6 +41,12 @@ class Order(Signal):
             v = str(v)
         return v
 
+    @field_validator('price_sources', mode='before')
+    def validate_price_sources(cls, v):
+        if isinstance(v, list):
+            return [PriceSource(**ps) if isinstance(ps, dict) else ps for ps in v]
+        return v
+
     # Using Pydantic's constructor instead of a custom from_dict method
     @classmethod
     def from_dict(cls, order_dict):
@@ -50,11 +57,9 @@ class Order(Signal):
     def get_order_age(self, order):
         return TimeUtil.now_in_millis() - order.processed_ms
 
-    def __str__(self):
-        # Ensuring the `trade_pair.trade_pair_id` is accessible for the string representation
-        # This assumes that trade_pair_id is a valid attribute of trade_pair
+    def to_python_dict(self):
         trade_pair_id = self.trade_pair.trade_pair_id if hasattr(self.trade_pair, 'trade_pair_id') else 'unknown'
-        return str({'trade_pair': trade_pair_id,
+        return {'trade_pair_id': trade_pair_id,
                     'order_type': self.order_type.name,
                     'leverage': self.leverage,
                     'price': self.price,
@@ -64,7 +69,14 @@ class Order(Signal):
                     'processed_ms': self.processed_ms,
                     'price_sources': self.price_sources,
                     'order_uuid': self.order_uuid,
-                    'src': self.src})
+                    'src': self.src}
+    def __str__(self):
+        # Ensuring the `trade_pair.trade_pair_id` is accessible for the string representation
+        # This assumes that trade_pair_id is a valid attribute of trade_pair
+        d = self.to_python_dict()
+        return str(d)
+
+
 
 class OrderStatus(Enum):
     OPEN = auto()

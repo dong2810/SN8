@@ -3,6 +3,7 @@
 
 import json
 import os
+import shutil
 import pickle
 import uuid
 from multiprocessing.managers import DictProxy
@@ -44,6 +45,14 @@ class ValiBkpUtils:
     def get_backup_file_path(use_data_dir=False):
         return ValiConfig.BASE_DIR + "/data/validator_checkpoint.json" if use_data_dir else \
                 ValiConfig.BASE_DIR + "/validator_checkpoint.json"
+
+    @staticmethod
+    def get_api_keys_file_path():
+        return ValiConfig.BASE_DIR + "/ptn_api/api_keys.json"
+
+    @staticmethod
+    def get_sequence_number_file_path():
+        return ValiConfig.BASE_DIR + "/ptn_api/sequence_number.json"
 
 
     @staticmethod
@@ -143,6 +152,10 @@ class ValiBkpUtils:
         return ans
 
     @staticmethod
+    def get_meta_json_path() -> str:
+        return ValiConfig.BASE_DIR + '/meta/meta.json'
+
+    @staticmethod
     def get_vali_weights_dir() -> str:
         return ValiConfig.BASE_DIR + "/validation/weights/"
 
@@ -219,7 +232,7 @@ class ValiBkpUtils:
             else:
                 f.write(json.dumps(vali_data, cls=CustomEncoder))
         # Move the file from temp to the final location
-        os.replace(temp_file_path, vali_file)
+        shutil.move(temp_file_path, vali_file)
 
     @staticmethod
     def write_file(

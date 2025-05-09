@@ -1,14 +1,16 @@
+import asyncio
 import json
 import threading
 import time
 import traceback
 from collections import defaultdict
 from copy import deepcopy
-from typing import List, Optional
-from polygon.websocket import WebSocketClient
+from typing import List
 
 import bittensor as bt
+from polygon import WebSocketClient
 from setproctitle import setproctitle
+from tiingo import TiingoWebsocketClient
 
 from time_util.time_util import TimeUtil, UnifiedMarketCalendar
 from vali_objects.vali_config import TradePair, TradePairCategory
@@ -31,8 +33,9 @@ def exception_handler_decorator():
                 return func(*args, **kwargs)
             except Exception as e:
                 func_name = func.__name__
-                bt.logging.error(f"Failed to get {func_name} with error: {e}, type: {type(e).__name__}")
-                bt.logging.error(traceback.format_exc())
+                thread_id = threading.get_native_id()
+                bt.logging.error(f"Failed to get {func_name} with error: {e}, type: {type(e).__name__} in thread {thread_id}")
+                #bt.logging.error(traceback.format_exc())
                 return {}
 
         return wrapper
@@ -52,6 +55,7 @@ class BaseDataService():
         self.latest_websocket_events = {}
         self.using_ipc = ipc_manager is not None
         self.n_flushes = 0
+        self.websocket_manager_thread = None
         self.trade_pair_to_recent_events_realtime = defaultdict(RecentEventTracker)
         if ipc_manager is None:
             self.trade_pair_to_recent_events = defaultdict(RecentEventTracker)
@@ -69,26 +73,26 @@ class BaseDataService():
             assert trade_pair.trade_pair_category in self.trade_pair_category_to_longest_allowed_lag_s, \
                 f"Trade pair {trade_pair} has no allowed lag time"
 
-        self.WEBSOCKET_THREADS = {
-            TradePairCategory.CRYPTO: Optional[threading.Thread],
-            TradePairCategory.FOREX: Optional[threading.Thread],
-            TradePairCategory.EQUITIES: Optional[threading.Thread]
-        }
+        # initialize our websocket slots to None
+        self.WEBSOCKET_THREADS = {}
+        self.WEBSOCKET_OBJECTS = {}
+        for tpc in [TradePairCategory.CRYPTO, TradePairCategory.FOREX, TradePairCategory.EQUITIES]:
+            self.WEBSOCKET_THREADS[tpc] = None
+            self.WEBSOCKET_OBJECTS[tpc] = None
 
-        self.WEBSOCKET_OBJECTS = {
-            TradePairCategory.CRYPTO: Optional[WebSocketClient],
-            TradePairCategory.FOREX: Optional[WebSocketClient],
-            TradePairCategory.EQUITIES: Optional[WebSocketClient]
-        }
+
 
     def get_close_rest(
             self,
-            trade_pair: TradePair
+            trade_pair: TradePair,
+            timestamp_ms: int
     ) -> PriceSource | None:
         pass
 
-    def is_market_open(self, trade_pair: TradePair) -> bool:
-        return self.market_calendar.is_market_open(trade_pair, TimeUtil.now_in_millis())
+    def is_market_open(self, trade_pair: TradePair, time_ms=None) -> bool:
+        if time_ms is None:
+            time_ms = TimeUtil.now_in_millis()
+        return self.market_calendar.is_market_open(trade_pair, time_ms)
 
     def get_close(self, trade_pair: TradePair) -> PriceSource | None:
         event = self.get_websocket_event(trade_pair)
@@ -109,98 +113,191 @@ class BaseDataService():
         return next((x for x in TradePair if x.trade_pair_category == tpc), None)
 
     def check_flush(self):
-        t0 = time.time()
-        # Flush the recent events to shared memory
-        for k in list(self.trade_pair_to_recent_events_realtime.keys()):
-            self.trade_pair_to_recent_events[k] = self.trade_pair_to_recent_events_realtime[k]
-            self.n_flushes += 1
-        if self.n_flushes % 500 == 0:
+        t0 = time.time() if self.n_flushes % 500 == 0 else 0
+        # Get a list of keys to avoid dictionary changed size during iteration
+        # By creating a static list of keys first, we avoid the dictionary size change issue
+        keys = list(self.trade_pair_to_recent_events_realtime.keys())
+        c = {}
+        for k in keys:
+            c[k] = deepcopy(self.trade_pair_to_recent_events_realtime[k])
+        # Flush the recent events to shared memory in one go
+        self.trade_pair_to_recent_events.update(c)
+        self.n_flushes += 1
+        if t0:
             t1 = time.time()
             bt.logging.info(
                 f"Flushed recent {self.provider_name} events to shared memory in {t1 - t0:.2f} seconds, n_flushes {self.n_flushes}")
 
+    def stop_threads(self):
+        """
+        Stop the threads that are running the websocket clients.
+        """
+        if self.websocket_manager_thread:
+            bt.logging.info(f"Stopping {self.provider_name} websocket manager thread")
+            self.websocket_manager_thread.join(timeout=1)
+            bt.logging.info(f"Stopped {self.provider_name} websocket manager thread")
+
+        for tpc in TradePairCategory:
+            self._kill_ws_for_category(tpc)
+            if self.WEBSOCKET_THREADS.get(tpc):
+                self.WEBSOCKET_THREADS[tpc].join(timeout=1)
+                bt.logging.info(f"Stopped {self.provider_name} websocket thread for {tpc.name.lower()}")
+            else:
+                bt.logging.warning(f"No websocket thread found for {tpc.name.lower()}")
+
     def websocket_manager(self):
-        setproctitle(f"vali_{self.__class__.__name__}")
+        """
+        This runs in a separate thread. It manages websockets using asyncio tasks
+        instead of threads, which simplifies the event loop management.
+        """
+        setproctitle(f"vali_ws_{self.provider_name}")
         bt.logging.enable_info()
-        tpc_to_prev_n_events = {x: 0 for x in TradePairCategory}
-        last_ws_health_check_s = 0
-        last_market_status_update_s = 0
-        while True:
-            now = time.time()
-            if now - last_ws_health_check_s > self.MAX_TIME_NO_EVENTS_S:
-                categories_reset_messages = []
-                for tpc in TradePairCategory:
-                    if tpc == TradePairCategory.INDICES:
+
+        # Create a single event loop for the thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+
+        # Define the websocket coroutine for each category
+        async def run_websocket(category):
+            while True:
+                try:
+                    # Create a new client
+                    self._create_websocket_client(category)
+                    self._subscribe_websockets(category)
+                    client = self.WEBSOCKET_OBJECTS.get(category)
+
+                    if client:
+                        bt.logging.info(f"Connecting {self.provider_name} websocket for {category}")
+                        # Use await instead of run_until_complete since we're in a coroutine
+                        await client.connect(self.handle_msg)
+                        bt.logging.warning(f"{self.provider_name}[{category}] connection closed, restarting")
+                    else:
+                        bt.logging.warning(f"{self.provider_name}[{category}] client not created, retrying")
+                        await asyncio.sleep(5)
                         continue
-                    if ((self.tpc_to_n_events[tpc] == tpc_to_prev_n_events[tpc]) and
-                            (last_ws_health_check_s == 0 or self.is_market_open(self.get_first_trade_pair_in_category(tpc)))):
-                        if last_ws_health_check_s == 0:
-                            msg = f"First websocket for {self.provider_name} {tpc.__str__()} created"
-                        else:
-                            msg = f'Websocket {self.provider_name} {tpc.__str__()} is stale {tpc_to_prev_n_events[tpc]}/{self.tpc_to_n_events[tpc]}'
-                        categories_reset_messages.append(msg)
-                        self.stop_start_websocket_threads(tpc=tpc)
 
-                last_ws_health_check_s = now
-                tpc_to_prev_n_events = deepcopy(self.tpc_to_n_events)
-                if categories_reset_messages:
-                    bt.logging.warning(
-                        f"Restarted websockets for [{categories_reset_messages}]")
+                except Exception as e:
+                    bt.logging.error(f"{self.provider_name}[{category}] websocket error: {e}")
+                    bt.logging.error(traceback.format_exc())
 
-            if now - last_market_status_update_s > self.DEBUG_LOG_INTERVAL_S:
-                last_market_status_update_s = now
-                self.debug_log()
+                # Clean up before reconnecting
+                try:
+                    await self._kill_ws_for_category(category)
+                    # Wait before reconnecting
+                    await asyncio.sleep(2)
+                except Exception as e:
+                    bt.logging.error(f"Error during websocket cleanup for {category}: {e}")
+                    await asyncio.sleep(5)  # Back off on errors
 
-            time.sleep(1)
-            if self.using_ipc:
-                self.check_flush()
-    def close_create_websocket_objects(self, tpc: TradePairCategory = None):
+        async def health_check():
+            tpc_to_prev = {t: 0 for t in TradePairCategory}
+            last_health_check = time.time()
+            last_debug = time.time()
+
+            while True:
+                try:
+                    now = time.time()
+                    if now - last_health_check > self.MAX_TIME_NO_EVENTS_S:
+                        resets = []
+                        for tpc in TradePairCategory:
+                            if tpc == TradePairCategory.INDICES:
+                                continue
+                            curr = self.tpc_to_n_events[tpc]
+                            prev = tpc_to_prev[tpc]
+
+                            if (curr == prev and self.is_market_open(self.get_first_trade_pair_in_category(tpc))):
+                                # Get a reference to the current websocket
+                                old: WebSocketClient|TiingoWebsocketClient = self.WEBSOCKET_OBJECTS.get(tpc)
+                                if old:
+                                    resets.append(tpc)
+                                    try:
+                                        await self._kill_ws_for_category(tpc)
+                                        bt.logging.info(f'Health check triggered shutdown for {tpc.name.lower()}')
+                                    except Exception as e:
+                                        bt.logging.warning(f"Health check shutdown trigger failed for {tpc}: {e}")
+
+                        tpc_to_prev = {t: self.tpc_to_n_events[t] for t in TradePairCategory}
+                        if resets:
+                            bt.logging.warning(
+                                f"Health check restarting {self.provider_name} websockets for {resets!r}. curr {curr} prev {prev}")
+                        last_health_check = now
+
+                    if self.using_ipc:
+                        self.check_flush()
+
+                    if now - last_debug > self.DEBUG_LOG_INTERVAL_S:
+                        try:
+                            self.debug_log()
+                        except Exception as e:
+                            bt.logging.error(f"debug_log() failed: {e}")
+                        last_debug = now
+
+                except Exception as e:
+                    bt.logging.error(f"Error in health check: {e}")
+                    bt.logging.error(traceback.format_exc())
+
+                await asyncio.sleep(1)
+
+        # Create and store tasks for each websocket category
+        tasks = []
+        for tpc in (TradePairCategory.CRYPTO, TradePairCategory.FOREX, TradePairCategory.EQUITIES):
+            task = loop.create_task(run_websocket(tpc))
+            tasks.append(task)
+
+        # Add the health check task
+        health_task = loop.create_task(health_check())
+        tasks.append(health_task)
+
+        # Run the event loop with all tasks
+        try:
+            loop.run_until_complete(asyncio.gather(*tasks))
+        except Exception as e:
+            bt.logging.error(f"Main event loop error: {e}")
+            bt.logging.error(traceback.format_exc())
+        finally:
+            try:
+                # Clean up any pending tasks
+                for task in tasks:
+                    task.cancel()
+
+                # Close the event loop
+                loop.close()
+            except Exception as e:
+                bt.logging.error(f"Error during shutdown: {e}")
+
+    async def _kill_ws_for_category(self, tpc:TradePairCategory):
+        """
+        Signal that a websocket should be closed.
+        """
+        client = self.WEBSOCKET_OBJECTS.get(tpc)
+        if client:
+            try:
+                client.unsubscribe_all()
+                bt.logging.info(f'Unsubscribed {self.provider_name} websocket for {tpc.name.lower()}')
+
+                # Set the should_close flag if the client has it
+                if hasattr(client, '_should_close'):
+                    client._should_close = True
+
+                # Since we're in the same event loop, we can safely close
+                await client.close()
+                bt.logging.info(f'Closed {self.provider_name} websocket for {tpc.name.lower()}')
+                self.WEBSOCKET_OBJECTS[tpc] = None
+
+            except Exception as e:
+                bt.logging.warning(f"Failed to initiate shutdown for {self.provider_name} websocket for {tpc}: {e}")
+
+    def _create_websocket_client(self, tpc):
         raise NotImplementedError
 
-    def main_stocks(self):
+    def _subscribe_websockets(self, tpc):
         raise NotImplementedError
 
-    def main_forex(self):
-        raise NotImplementedError
-
-    def main_crypto(self):
+    async def handle_msg(self, msg):
         raise NotImplementedError
 
     def instantiate_not_pickleable_objects(self):
         raise NotImplementedError
-
-    def stop_start_websocket_threads(self, tpc: TradePairCategory = None):
-        if self.provider_name == POLYGON_PROVIDER_NAME:
-            self.close_create_websocket_objects(tpc=tpc)
-
-        self.stop_threads(tpc)
-        time.sleep(5)
-
-        tpcs = [tpc] if tpc is not None else TradePairCategory
-        for tpc in tpcs:
-            if tpc == TradePairCategory.INDICES:
-                continue
-            elif tpc == TradePairCategory.EQUITIES:
-                target = self.main_stocks
-            elif tpc == TradePairCategory.FOREX:
-                target = self.main_forex
-            elif tpc == TradePairCategory.CRYPTO:
-                target = self.main_crypto
-            else:
-                raise ValueError(f"Invalid tpc {tpc}")
-
-            self.WEBSOCKET_THREADS[tpc] = threading.Thread(target=target, daemon=True)
-            self.WEBSOCKET_THREADS[tpc].start()
-
-
-
-    def stop_threads(self, tpc: TradePairCategory = None):
-        threads_to_check = self.WEBSOCKET_THREADS if tpc is None else {tpc: self.WEBSOCKET_THREADS[tpc]}
-        if any([isinstance(x, threading.Thread) for x in threads_to_check]):
-            for k, thread in self.WEBSOCKET_THREADS.items():
-                print(f'joining {self.provider_name} thread for tpc {k}')
-                thread.join(timeout=1)
-                print(f'terminated {self.provider_name} thread for tpc {k}')
 
     def get_closes_websocket(self, trade_pairs: List[TradePair], trade_pair_to_last_order_time_ms) -> dict[str: PriceSource]:
         events = {}
@@ -273,14 +370,6 @@ class BaseDataService():
 
         bt.logging.info(f"{self.provider_name} Latest websocket prices: {formatted_prices}")
         bt.logging.info(f'{self.provider_name} websocket n_events_global: {self.tpc_to_n_events}. n_equity_events_skipped_afterhours: {self.n_equity_events_skipped_afterhours}')
-        #if self.provider_name == POLYGON_PROVIDER_NAME:
-        #    # Log which trade pairs are likely in closed markets
-        #    closed_trade_pairs = {}
-        #    for trade_pair in TradePair:
-        #        if not self.is_market_open(trade_pair):
-        #            closed_trade_pairs[trade_pair.trade_pair] = self.closed_market_prices[trade_pair]
-        #
-        #    bt.logging.info(f"{self.provider_name} Market closed with closing prices for {closed_trade_pairs}")
 
     def get_price_before_market_close(self, trade_pair: TradePair) -> float | None:
         pass
